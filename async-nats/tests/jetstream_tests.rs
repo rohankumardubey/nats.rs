@@ -2331,11 +2331,6 @@ mod jetstream {
             .await
             .unwrap()
             .await;
-        println!("ACK: {ack:?}");
-        println!(
-            "DOWNCAST: {:?}",
-            ack.unwrap_err().downcast::<std::io::Error>()
-        );
         // assert_eq!(
         //     ack.unwrap_err()
         //         .downcast::<std::io::Error>()
@@ -2825,6 +2820,7 @@ mod jetstream {
 
     #[tokio::test]
     async fn publish_no_stream() {
+        use std::error::Error;
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = async_nats::connect(server.client_url()).await.unwrap();
         let context = async_nats::jetstream::new(client.clone());
@@ -2835,7 +2831,9 @@ mod jetstream {
                 .unwrap()
                 .await
                 .unwrap_err()
-                .downcast::<std::io::Error>()
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
                 .unwrap()
                 .kind(),
             std::io::ErrorKind::NotFound

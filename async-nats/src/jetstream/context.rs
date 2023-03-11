@@ -121,7 +121,7 @@ impl Context {
         &self,
         subject: String,
         payload: Bytes,
-    ) -> Result<PublishAckFuture, Error> {
+    ) -> Result<PublishAckFuture, PublishError> {
         self.send_publish(subject, Publish::build().payload(payload))
             .await
     }
@@ -150,7 +150,7 @@ impl Context {
         subject: String,
         headers: crate::header::HeaderMap,
         payload: Bytes,
-    ) -> Result<PublishAckFuture, Error> {
+    ) -> Result<PublishAckFuture, PublishError> {
         self.send_publish(subject, Publish::build().payload(payload).headers(headers))
             .await
     }
@@ -179,9 +179,13 @@ impl Context {
         &self,
         subject: String,
         publish: Publish,
-    ) -> Result<PublishAckFuture, Error> {
+    ) -> Result<PublishAckFuture, PublishError> {
         let inbox = self.client.new_inbox();
-        let response = self.client.subscribe(inbox.clone()).await?;
+        let response = self
+            .client
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err))?;
         tokio::time::timeout(self.timeout, async {
             if let Some(headers) = publish.headers {
                 self.client
@@ -198,10 +202,9 @@ impl Context {
                     .await
             }
         })
-        .map_err(|_| {
-            std::io::Error::new(ErrorKind::TimedOut, "JetStream publish request timed out")
-        })
-        .await??;
+        .map_err(|_| PublishError::new(PublishErrorKind::TimedOut))
+        .await?
+        .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err))?;
 
         Ok(PublishAckFuture {
             timeout: self.timeout,
@@ -252,6 +255,12 @@ impl Context {
                 "the stream name must not be empty",
             )));
         }
+        if config.name.contains([' ', '.']) {
+            return Err(Box::new(io::Error::new(
+                ErrorKind::InvalidInput,
+                "stream name cannot contain `.`, `_`",
+            )));
+        }
         if let Some(ref mut mirror) = config.mirror {
             if let Some(ref mut domain) = mirror.domain {
                 if mirror.external.is_some() {
@@ -289,10 +298,7 @@ impl Context {
         match response {
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while creating stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while creating stream: {}", error),
             ))),
             Response::Ok(info) => Ok(Stream {
                 context: self.clone(),
@@ -330,10 +336,7 @@ impl Context {
         match request {
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting stream: {}", error),
             ))),
             Response::Ok(info) => Ok(Stream {
                 context: self.clone(),
@@ -372,13 +375,10 @@ impl Context {
 
         let request: Response<Info> = self.request(subject, &()).await?;
         match request {
-            Response::Err { error } if error.status == 404 => self.create_stream(&config).await,
+            Response::Err { error } if error.code() == 404 => self.create_stream(&config).await,
             Response::Err { error } => Err(Box::new(io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting or creating stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting or creating stream: {}", error),
             ))),
             Response::Ok(info) => Ok(Stream {
                 context: self.clone(),
@@ -414,10 +414,7 @@ impl Context {
         match self.request(subject, &json!({})).await? {
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while deleting stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while deleting stream: {}", error,),
             ))),
             Response::Ok(delete_response) => Ok(delete_response),
         }
@@ -879,6 +876,11 @@ impl Context {
     }
 }
 
+pub struct GenericError<T> {
+    kind: T,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
 #[derive(Debug, Error)]
 pub struct PublishError {
     kind: PublishErrorKind,
@@ -886,24 +888,14 @@ pub struct PublishError {
 }
 
 impl PublishError {
-    fn new(kind: PublishErrorKind) -> PublishError {
-        PublishError { kind, source: None }
-    }
-    fn with_source<E>(kind: PublishErrorKind, source: E) -> PublishError
-    where
-        E: Into<Box<dyn std::error::Error + Sync + Send>>,
-    {
-        PublishError {
-            kind,
-            source: Some(source.into()),
-        }
-    }
+    impls!(PublishErrorKind);
 }
 
 impl Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let source = self
             .source
+            .as_ref()
             .map(|source| source.to_string())
             .unwrap_or("unkown".to_string());
         match self.kind {
@@ -915,7 +907,7 @@ impl Display for PublishError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum PublishErrorKind {
     StreamNotFound,
     TimedOut,
@@ -1191,7 +1183,15 @@ pub struct QueryAccountError(#[from] super::errors::Error);
 #[error("error: {0}")]
 pub struct JetStreamError(#[from] super::errors::Error);
 
-#[derive(Debug)]
+// This is double-lazy.
+// Not only we should not need this type, but also the `from is... is so bad.`
+impl From<super::context::RequestError> for JetStreamError {
+    fn from(source: super::context::RequestError) -> Self {
+        JetStreamError(*source.source.unwrap().downcast().unwrap())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum RequestErrorKind {
     NoResponders,
     TimedOut,

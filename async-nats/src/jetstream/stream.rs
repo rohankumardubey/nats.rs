@@ -75,10 +75,7 @@ impl Stream {
             }
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting stream info: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting stream info: {}", error),
             ))),
         }
     }
@@ -415,10 +412,7 @@ impl Stream {
         match response {
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting message: {}, {}",
-                    error.code, error.description
-                ),
+                format!("nats: error while getting message: {}", error),
             ))),
             Response::Ok(value) => Ok(value.message),
         }
@@ -497,10 +491,7 @@ impl Stream {
         match response {
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while deleting message: {}, {}",
-                    error.code, error.status
-                ),
+                format!("nats: error while deleting message: {}", error),
             ))),
             Response::Ok(value) => Ok(value.success),
         }
@@ -621,10 +612,7 @@ impl Stream {
         {
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while creating stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while creating stream: {}", error),
             ))),
             Response::Ok::<consumer::Info>(info) => Ok(Consumer::new(
                 FromConsumer::try_from_consumer_config(info.clone().config)?,
@@ -659,10 +647,7 @@ impl Stream {
             Response::Ok(info) => Ok(info),
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting consumer info: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting consumer info: {}", error),
             ))),
         }
     }
@@ -728,13 +713,10 @@ impl Stream {
         let subject = format!("CONSUMER.INFO.{}.{}", self.info.config.name, name);
 
         match self.context.request(subject, &json!({})).await? {
-            Response::Err { error } if error.status == 404 => self.create_consumer(config).await,
+            Response::Err { error } if error.code() == 404 => self.create_consumer(config).await,
             Response::Err { error } => Err(Box::new(io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting or creating stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting or creating stream: {}", error),
             ))),
             Response::Ok::<consumer::Info>(info) => Ok(Consumer::new(
                 T::try_from_consumer_config(info.config.clone())?,
@@ -768,10 +750,7 @@ impl Stream {
             Response::Ok(delete_status) => Ok(delete_status),
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while deleting consumer: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while deleting consumer: {}", error),
             ))),
         }
     }
@@ -1418,10 +1397,7 @@ where
             match response {
                 Response::Err { error } => Err(Box::from(io::Error::new(
                     ErrorKind::Other,
-                    format!(
-                        "error while purging stream: {}, {}, {}",
-                        error.code, error.status, error.description
-                    ),
+                    format!("error while purging stream: {}", error),
                 ))),
                 Response::Ok(response) => Ok(response),
             }

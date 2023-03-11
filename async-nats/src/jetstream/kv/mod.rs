@@ -25,7 +25,7 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{header, jetstream::response, Error, Message};
+use crate::{header, Error, Message};
 
 use self::bucket::Status;
 
@@ -328,14 +328,17 @@ impl Store {
                         ))
                     }
                     Err(err) => {
-                        let e: std::io::Error = *err.downcast().unwrap();
-                        let d = e.get_ref().unwrap();
-                        let de = d.downcast_ref::<response::Error>().unwrap();
+                        // FIXME(tp): handle it properly when we have proper errors
+                        let de = err
+                            .source()
+                            .unwrap()
+                            .downcast_ref::<super::errors::Error>()
+                            .unwrap();
                         // 10037 is returned when there are no messages found.
-                        if de.code == 10037 {
+                        if de.code() == 10037 {
                             None
                         } else {
-                            return Err(Box::new(e));
+                            return Err(err);
                         }
                     }
                 }
@@ -494,6 +497,7 @@ impl Store {
             .await?
             .await
             .map(|publish_ack| publish_ack.sequence)
+            .map_err(|err| Box::from(std::io::Error::new(ErrorKind::Other, err)))
     }
 
     /// Deletes a given key. This is a non-destructive operation, which sets a `DELETE` marker.

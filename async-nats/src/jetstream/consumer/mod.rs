@@ -82,10 +82,7 @@ impl<T: IntoConsumerConfig> Consumer<T> {
             }
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting consumer info: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting consumer info: {}", error),
             ))),
         }
     }
@@ -97,10 +94,7 @@ impl<T: IntoConsumerConfig> Consumer<T> {
             Response::Ok::<Info>(info) => Ok(info),
             Response::Err { error } => Err(Box::new(std::io::Error::new(
                 ErrorKind::Other,
-                format!(
-                    "nats: error while getting consumer info: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
+                format!("nats: error while getting consumer info: {}", error),
             ))),
         }
     }

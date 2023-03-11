@@ -12,6 +12,7 @@
 // limitations under the License.
 
 use crate::connection::State;
+use crate::jetstream::errors::impls;
 use crate::ServerInfo;
 
 use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
@@ -609,27 +610,13 @@ impl Display for RequestError {
         match self.kind {
             RequestErrorKind::TimedOut => write!(f, "request timed out"),
             RequestErrorKind::NoResponders => write!(f, "no responders"),
-            RequestErrorKind::Other => write!(f, "request failed: {:?}", self.source),
+            RequestErrorKind::Other => write!(f, "request failed: {:?}", self.kind),
         }
     }
 }
 
 impl RequestError {
-    fn with_source<E>(kind: RequestErrorKind, source: E) -> RequestError
-    where
-        E: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        RequestError {
-            kind,
-            source: Some(source.into()),
-        }
-    }
-
-    /// Returns the [RequestErrorKind] enum, allowing iterating over
-    /// all error variants.
-    pub fn kind(&self) -> RequestErrorKind {
-        self.kind
-    }
+    impls!(RequestErrorKind);
 }
 
 /// Error returned when flushing the messages buffered on the client fails.

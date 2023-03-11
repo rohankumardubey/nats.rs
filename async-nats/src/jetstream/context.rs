@@ -24,6 +24,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use std::borrow::Borrow;
+use std::fmt::Display;
 use std::future::IntoFuture;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
@@ -32,6 +33,7 @@ use std::task::Poll;
 use std::time::Duration;
 use tracing::debug;
 
+use super::errors::impls;
 use super::kv::{Store, MAX_HISTORY};
 use super::object_store::{is_valid_bucket_name, ObjectStore};
 use super::stream::{self, Config, DeleteStatus, DiscardPolicy, External, Info, Stream};
@@ -212,13 +214,7 @@ impl Context {
         let response: Response<Account> = self.request("INFO".into(), b"").await?;
 
         match response {
-            Response::Err { error } => Err(Box::new(std::io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "nats: error while querying account information: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
-            ))),
+            Response::Err { error } => Err(error.into()),
             Response::Ok(account) => Ok(account),
         }
     }
@@ -449,20 +445,14 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn update_stream<S>(&self, config: S) -> Result<Info, Error>
+    pub async fn update_stream<S>(&self, config: S) -> Result<Info, JetStreamError>
     where
         S: Borrow<Config>,
     {
         let config = config.borrow();
         let subject = format!("STREAM.UPDATE.{}", config.name);
         match self.request(subject, config).await? {
-            Response::Err { error } => Err(Box::new(std::io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "nats: error while updating stream: {}, {}, {}",
-                    error.code, error.status, error.description
-                ),
-            ))),
+            Response::Err { error } => Err(error.into()),
             Response::Ok(info) => Ok(info),
         }
     }
@@ -749,12 +739,18 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn request<T, V>(&self, subject: String, payload: &T) -> Result<Response<V>, Error>
+    pub async fn request<T, V>(
+        &self,
+        subject: String,
+        payload: &T,
+    ) -> Result<Response<V>, RequestError>
     where
         T: ?Sized + Serialize,
         V: DeserializeOwned,
     {
-        let request = serde_json::to_vec(&payload).map(Bytes::from)?;
+        let request = serde_json::to_vec(&payload)
+            .map(Bytes::from)
+            .map_err(|err| RequestError::with_source(RequestErrorKind::Other, err))?;
 
         debug!("JetStream request sent: {:?}", request);
 
@@ -766,7 +762,8 @@ impl Context {
             "JetStream request response: {:?}",
             from_utf8(&message.payload)
         );
-        let response = serde_json::from_slice(message.payload.as_ref())?;
+        let response = serde_json::from_slice(message.payload.as_ref())
+            .map_err(|err| RequestError::with_source(RequestErrorKind::ResponseParse, err))?;
 
         Ok(response)
     }
@@ -882,6 +879,50 @@ impl Context {
     }
 }
 
+#[derive(Debug, Error)]
+pub struct PublishError {
+    kind: PublishErrorKind,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl PublishError {
+    fn new(kind: PublishErrorKind) -> PublishError {
+        PublishError { kind, source: None }
+    }
+    fn with_source<E>(kind: PublishErrorKind, source: E) -> PublishError
+    where
+        E: Into<Box<dyn std::error::Error + Sync + Send>>,
+    {
+        PublishError {
+            kind,
+            source: Some(source.into()),
+        }
+    }
+}
+
+impl Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = self
+            .source
+            .map(|source| source.to_string())
+            .unwrap_or("unkown".to_string());
+        match self.kind {
+            PublishErrorKind::StreamNotFound => write!(f, "no stream found for given subject"),
+            PublishErrorKind::TimedOut => write!(f, "timed out: didn't receive ack in time"),
+            PublishErrorKind::Other => write!(f, "publish failed: {}", source),
+            PublishErrorKind::BrokenPipe => write!(f, "broken pipe"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PublishErrorKind {
+    StreamNotFound,
+    TimedOut,
+    BrokenPipe,
+    Other,
+}
+
 #[derive(Debug)]
 pub struct PublishAckFuture {
     timeout: Duration,
@@ -889,34 +930,23 @@ pub struct PublishAckFuture {
 }
 
 impl PublishAckFuture {
-    async fn next_with_timeout(mut self) -> Result<PublishAck, Error> {
+    async fn next_with_timeout(mut self) -> Result<PublishAck, PublishError> {
         self.subscription.sender.send(Command::TryFlush).await.ok();
         let next = tokio::time::timeout(self.timeout, self.subscription.next())
             .await
-            .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "acknowledgment timed out"))?;
+            .map_err(|_| PublishError::new(PublishErrorKind::TimedOut))?;
         next.map_or_else(
-            || {
-                Err(Box::from(std::io::Error::new(
-                    ErrorKind::Other,
-                    "broken pipe",
-                )))
-            },
+            || Err(PublishError::new(PublishErrorKind::BrokenPipe)),
             |m| {
                 if m.status == Some(StatusCode::NO_RESPONDERS) {
-                    return Err(Box::from(std::io::Error::new(
-                        ErrorKind::NotFound,
-                        "no stream found for given subject",
-                    )));
+                    return Err(PublishError::new(PublishErrorKind::StreamNotFound));
                 }
-                let response = serde_json::from_slice(m.payload.as_ref())?;
+                let response = serde_json::from_slice(m.payload.as_ref())
+                    .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err))?;
                 match response {
-                    Response::Err { error } => Err(Box::from(std::io::Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "nats: error while publishing message: {}, {}, {}",
-                            error.code, error.status, error.description
-                        ),
-                    ))),
+                    Response::Err { error } => {
+                        Err(PublishError::with_source(PublishErrorKind::Other, error))
+                    }
                     Response::Ok(publish_ack) => Ok(publish_ack),
                 }
             },
@@ -924,9 +954,9 @@ impl PublishAckFuture {
     }
 }
 impl IntoFuture for PublishAckFuture {
-    type Output = Result<PublishAck, Error>;
+    type Output = Result<PublishAck, PublishError>;
 
-    type IntoFuture = Pin<Box<dyn Future<Output = Result<PublishAck, Error>> + Send>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<PublishAck, PublishError>> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(std::future::IntoFuture::into_future(
@@ -1150,5 +1180,63 @@ impl Publish {
             header::NATS_EXPECTED_STREAM,
             HeaderValue::from(stream.as_ref()),
         )
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("failed to query account: {0}")]
+pub struct QueryAccountError(#[from] super::errors::Error);
+
+#[derive(Debug, Error)]
+#[error("error: {0}")]
+pub struct JetStreamError(#[from] super::errors::Error);
+
+#[derive(Debug)]
+pub enum RequestErrorKind {
+    NoResponders,
+    TimedOut,
+    ResponseParse,
+    Other,
+}
+
+impl Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = self.format_source();
+        match self.kind {
+            RequestErrorKind::TimedOut => write!(f, "timed out"),
+            RequestErrorKind::ResponseParse => {
+                write!(f, "failed to parse the response: {}", source)
+            }
+            RequestErrorKind::Other => write!(f, "request failed: {}", source),
+            RequestErrorKind::NoResponders => {
+                write!(f, "requested JetStream resource does not exist: {}", source)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub struct RequestError {
+    kind: RequestErrorKind,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl RequestError {
+    impls!(RequestErrorKind);
+}
+
+impl From<crate::RequestError> for RequestError {
+    fn from(error: crate::RequestError) -> Self {
+        match error.kind() {
+            crate::RequestErrorKind::TimedOut => {
+                RequestError::with_source(RequestErrorKind::TimedOut, error)
+            }
+            crate::RequestErrorKind::NoResponders => {
+                RequestError::new(RequestErrorKind::NoResponders)
+            }
+            crate::RequestErrorKind::Other => {
+                RequestError::with_source(RequestErrorKind::Other, error)
+            }
+        }
     }
 }
